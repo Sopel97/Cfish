@@ -362,11 +362,341 @@ INLINE int neon_movemask(uint8x16_t v)
 #endif
 #endif
 
+#define MAX_DIMS 512
+
 INLINE void hidden_layer(const int8_t *input, void *output, unsigned dims,
     const int32_t *biases, const weight_t *weights, mask_t *inMask,
     mask_t *outMask, const bool pack8_and_calc_mask)
 {
 #if defined(USE_AVX512)
+
+//* v1 */ /*
+// seems to be the best but there's a lot of code to prepare indices (though doesn't look like it takes much time)
+  const __m512i kZero = _mm512_setzero_si512();
+  __m512i out_0 = ((__m512i *)biases)[0];
+  __m512i out_1 = ((__m512i *)biases)[1];
+  __m512i first, second;
+
+  alignas(64) uint16_t indices[MAX_DIMS];
+  int num_indices = 0;
+  const __m512i base_offsets = _mm512_set_epi8(
+    63, 62, 61, 60,
+    59, 58, 57, 56, 55, 54, 53, 52, 51, 50,
+    49, 48, 47, 46, 45, 44, 43, 42, 41, 40,
+    39, 38, 37, 36, 35, 34, 33, 32, 31, 30,
+    29, 28, 27, 26, 25, 24, 23, 22, 21, 20,
+    19, 18, 17, 16, 15, 14, 13, 12, 11, 10,
+    9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+  );
+  const __m512i index_stride = _mm512_set1_epi16(64);
+  __m512i index_offset = kZero;
+
+  for(int offset = 0; offset < dims; offset += 8 * sizeof(mask_t))
+  {
+    const int i = offset / (8 * sizeof(mask_t));
+
+    const uint64_t mask_int = _cvtmask64_u64(inMask[i]);
+
+    const __m512i mask_indices = _mm512_maskz_compress_epi8(inMask[i], base_offsets);
+    __m512i mask_indices_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(mask_indices));
+    __m512i mask_indices_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(mask_indices, 1));
+
+    mask_indices_lo = _mm512_add_epi16(mask_indices_lo, index_offset);
+    mask_indices_hi = _mm512_add_epi16(mask_indices_hi, index_offset);
+
+    _mm512_storeu_si512((__m512i*)(indices + num_indices), mask_indices_lo);
+    _mm512_storeu_si512((__m512i*)(indices + num_indices + 32), mask_indices_hi);
+
+    num_indices += _mm_popcnt_u64(mask_int);
+    index_offset = _mm512_add_epi16(index_offset, index_stride);
+  }
+
+  int i = 0;
+  for(; i < num_indices - 1; i += 2)
+  {
+    int idx0 = indices[i + 0];
+    int idx1 = indices[i + 1];
+    uint16_t factor = input[idx0] | (input[idx1] << 8);
+    first = ((__m512i *)weights)[idx0];
+    second = ((__m512i *)weights)[idx1];
+
+    __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+    prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+    signs = _mm512_srai_epi16(prod, 15);
+    out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+    out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+  }
+
+  for(; i < num_indices; ++i)
+  {
+    int idx0 = indices[i + 0];
+    uint16_t factor = input[idx0];
+    first = ((__m512i *)weights)[idx0];
+    second = kZero;
+
+    __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+    prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+    signs = _mm512_srai_epi16(prod, 15);
+    out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+    out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+  }
+
+  __m512i out16 = _mm512_srai_epi16(_mm512_packs_epi32(out_0, out_1), SHIFT);
+
+  __m256i *outVec = (__m256i *)output;
+  const __m256i kZero256 = _mm256_setzero_si256();
+  outVec[0] = _mm256_packs_epi16(
+      _mm512_castsi512_si256(out16),_mm512_extracti64x4_epi64(out16, 1));
+  if (pack8_and_calc_mask)
+    outMask[0] = (uint32_t)_mm256_movemask_epi8(_mm256_cmpgt_epi8(outVec[0], kZero256));
+  else
+    outVec[0] = _mm256_max_epi8(outVec[0], kZero256);
+//*/
+
+/* v2 */ /*
+// okish but looks worse than v1
+  const __m512i kZero = _mm512_setzero_si512();
+  __m512i out_0 = ((__m512i *)biases)[0];
+  __m512i out_1 = ((__m512i *)biases)[1];
+  __m512i first, second;
+
+  const __m512i base_offsets = _mm512_set_epi8(
+    63, 62, 61, 60,
+    59, 58, 57, 56, 55, 54, 53, 52, 51, 50,
+    49, 48, 47, 46, 45, 44, 43, 42, 41, 40,
+    39, 38, 37, 36, 35, 34, 33, 32, 31, 30,
+    29, 28, 27, 26, 25, 24, 23, 22, 21, 20,
+    19, 18, 17, 16, 15, 14, 13, 12, 11, 10,
+    9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+  );
+
+  for(int offset = 0; offset < dims; offset += 8 * sizeof(mask_t))
+  {
+    alignas(64) uint8_t indices[64];
+
+    const int i = offset / (8 * sizeof(mask_t));
+
+    const int num_indices = _mm_popcnt_u64(_cvtmask64_u64(inMask[i]));
+    const __m512i mask_indices = _mm512_maskz_compress_epi8(inMask[i], base_offsets);
+    _mm512_storeu_si512((__m512i*)(indices), mask_indices);
+
+    int j = 0;
+    for(; j < num_indices - 1; j += 2)
+    {
+      int idx0 = offset + indices[j + 0];
+      int idx1 = offset + indices[j + 1];
+      uint16_t factor = input[idx0] | (input[idx1] << 8);
+      first = ((__m512i *)weights)[idx0];
+      second = ((__m512i *)weights)[idx1];
+
+      __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+      prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+      signs = _mm512_srai_epi16(prod, 15);
+      out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+      out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+    }
+
+    for(; j < num_indices; ++j)
+    {
+      int idx0 = offset + indices[j + 0];
+      uint16_t factor = input[idx0];
+      first = ((__m512i *)weights)[idx0];
+      second = kZero;
+
+      __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+      prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+      signs = _mm512_srai_epi16(prod, 15);
+      out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+      out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+    }
+  }
+
+  __m512i out16 = _mm512_srai_epi16(_mm512_packs_epi32(out_0, out_1), SHIFT);
+
+  __m256i *outVec = (__m256i *)output;
+  const __m256i kZero256 = _mm256_setzero_si256();
+  outVec[0] = _mm256_packs_epi16(
+      _mm512_castsi512_si256(out16),_mm512_extracti64x4_epi64(out16, 1));
+  if (pack8_and_calc_mask)
+    outMask[0] = (uint32_t)_mm256_movemask_epi8(_mm256_cmpgt_epi8(outVec[0], kZero256));
+  else
+    outVec[0] = _mm256_max_epi8(outVec[0], kZero256);
+//*/
+
+/* v3 */ /*
+// about the same as v2
+  const __m512i kZero = _mm512_setzero_si512();
+  __m512i out_0 = ((__m512i *)biases)[0];
+  __m512i out_1 = ((__m512i *)biases)[1];
+  __m512i first, second;
+
+  const __m512i base_offsets = _mm512_set_epi8(
+    63, 62, 61, 60,
+    59, 58, 57, 56, 55, 54, 53, 52, 51, 50,
+    49, 48, 47, 46, 45, 44, 43, 42, 41, 40,
+    39, 38, 37, 36, 35, 34, 33, 32, 31, 30,
+    29, 28, 27, 26, 25, 24, 23, 22, 21, 20,
+    19, 18, 17, 16, 15, 14, 13, 12, 11, 10,
+    9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+  );
+
+  uint16_t leftover_indices[8];
+  int num_leftover_indices = 0;
+
+  for(int offset = 0; offset < dims; offset += 8 * sizeof(mask_t))
+  {
+    alignas(64) uint8_t indices[64];
+
+    const int i = offset / (8 * sizeof(mask_t));
+
+    const int num_indices = _mm_popcnt_u64(_cvtmask64_u64(inMask[i]));
+    const __m512i mask_indices = _mm512_maskz_compress_epi8(inMask[i], base_offsets);
+    _mm512_storeu_si512((__m512i*)(indices), mask_indices);
+
+    int j = 0;
+    for(; j < num_indices - 1; j += 2)
+    {
+      int idx0 = offset + indices[j + 0];
+      int idx1 = offset + indices[j + 1];
+      uint16_t factor = input[idx0] | (input[idx1] << 8);
+      first = ((__m512i *)weights)[idx0];
+      second = ((__m512i *)weights)[idx1];
+
+      __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+      prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+      signs = _mm512_srai_epi16(prod, 15);
+      out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+      out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+    }
+
+    for(; j < num_indices; ++j)
+    {
+      leftover_indices[num_leftover_indices++] = offset + indices[j + 0];
+    }
+  }
+
+  int j = 0;
+  for(; j < num_leftover_indices - 1; j += 2)
+  {
+    int idx0 = leftover_indices[j + 0];
+    int idx1 = leftover_indices[j + 1];
+    uint16_t factor = input[idx0] | (input[idx1] << 8);
+    first = ((__m512i *)weights)[idx0];
+    second = ((__m512i *)weights)[idx1];
+
+    __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+    prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+    signs = _mm512_srai_epi16(prod, 15);
+    out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+    out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+  }
+
+  for(; j < num_leftover_indices; ++j)
+  {
+    int idx0 = leftover_indices[j + 0];
+    uint16_t factor = input[idx0];
+    first = ((__m512i *)weights)[idx0];
+    second = kZero;
+
+    __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+    prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+    signs = _mm512_srai_epi16(prod, 15);
+    out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+    out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+  }
+
+  __m512i out16 = _mm512_srai_epi16(_mm512_packs_epi32(out_0, out_1), SHIFT);
+
+  __m256i *outVec = (__m256i *)output;
+  const __m256i kZero256 = _mm256_setzero_si256();
+  outVec[0] = _mm256_packs_epi16(
+      _mm512_castsi512_si256(out16),_mm512_extracti64x4_epi64(out16, 1));
+  if (pack8_and_calc_mask)
+    outMask[0] = (uint32_t)_mm256_movemask_epi8(_mm256_cmpgt_epi8(outVec[0], kZero256));
+  else
+    outVec[0] = _mm256_max_epi8(outVec[0], kZero256);
+//*/
+
+/* v4 */ /*
+// doesn't look very good. manually going through indices
+// and rewriting them with the offset seems too much
+  const __m512i kZero = _mm512_setzero_si512();
+  __m512i out_0 = ((__m512i *)biases)[0];
+  __m512i out_1 = ((__m512i *)biases)[1];
+  __m512i first, second;
+
+  alignas(64) uint16_t indices[MAX_DIMS];
+  int num_indices = 0;
+  const __m512i base_offsets = _mm512_set_epi8(
+    63, 62, 61, 60,
+    59, 58, 57, 56, 55, 54, 53, 52, 51, 50,
+    49, 48, 47, 46, 45, 44, 43, 42, 41, 40,
+    39, 38, 37, 36, 35, 34, 33, 32, 31, 30,
+    29, 28, 27, 26, 25, 24, 23, 22, 21, 20,
+    19, 18, 17, 16, 15, 14, 13, 12, 11, 10,
+    9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+  );
+
+  for(int offset = 0; offset < dims; offset += 8 * sizeof(mask_t))
+  {
+    alignas(64) uint8_t local_indices[64];
+
+    const int i = offset / (8 * sizeof(mask_t));
+
+    const uint64_t mask_int = _cvtmask64_u64(inMask[i]);
+    const __m512i mask_indices = _mm512_maskz_compress_epi8(inMask[i], base_offsets);
+    _mm512_storeu_si512((__m512i*)(local_indices), mask_indices);
+    int num_local_indices = _mm_popcnt_u64(mask_int);
+
+    while(num_local_indices--)
+    {
+      indices[num_indices++] = offset + local_indices[num_local_indices];
+    }
+  }
+
+  int i = 0;
+  for(; i < num_indices - 1; i += 2)
+  {
+    int idx0 = indices[i + 0];
+    int idx1 = indices[i + 1];
+    uint16_t factor = input[idx0] | (input[idx1] << 8);
+    first = ((__m512i *)weights)[idx0];
+    second = ((__m512i *)weights)[idx1];
+
+    __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+    prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+    signs = _mm512_srai_epi16(prod, 15);
+    out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+    out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+  }
+
+  if (num_indices & 1)
+  {
+    int idx0 = indices[i];
+    uint16_t factor = input[idx0];
+    first = ((__m512i *)weights)[idx0];
+    second = kZero;
+
+    __m512i mul = _mm512_set1_epi16(factor), prod, signs;
+    prod = _mm512_maddubs_epi16(mul, _mm512_unpacklo_epi8(first, second));
+    signs = _mm512_srai_epi16(prod, 15);
+    out_0 = _mm512_add_epi32(out_0, _mm512_unpacklo_epi16(prod, signs));
+    out_1 = _mm512_add_epi32(out_1, _mm512_unpackhi_epi16(prod, signs));
+  }
+
+  __m512i out16 = _mm512_srai_epi16(_mm512_packs_epi32(out_0, out_1), SHIFT);
+
+  __m256i *outVec = (__m256i *)output;
+  const __m256i kZero256 = _mm256_setzero_si256();
+  outVec[0] = _mm256_packs_epi16(
+      _mm512_castsi512_si256(out16),_mm512_extracti64x4_epi64(out16, 1));
+  if (pack8_and_calc_mask)
+    outMask[0] = (uint32_t)_mm256_movemask_epi8(_mm256_cmpgt_epi8(outVec[0], kZero256));
+  else
+    outVec[0] = _mm256_max_epi8(outVec[0], kZero256);
+//*/
+
+/* original */ /*
   const __m512i kZero = _mm512_setzero_si512();
   __m512i out_0 = ((__m512i *)biases)[0];
   __m512i out_1 = ((__m512i *)biases)[1];
@@ -404,6 +734,8 @@ INLINE void hidden_layer(const int8_t *input, void *output, unsigned dims,
   else
     outVec[0] = _mm256_max_epi8(outVec[0], kZero256);
 
+
+//*/
 #elif defined(USE_AVX2)
   const __m256i kZero = _mm256_setzero_si256();
   __m256i out_0 = ((__m256i *)biases)[0];

@@ -619,7 +619,7 @@ endif
 ifeq ($(avx512),yes)
 	CFLAGS += -DUSE_AVX512
 	ifeq ($(comp),$(filter $(comp),gcc clang mingw))
-		CFLAGS += -mavx512f -mavx512bw
+		CFLAGS += -mavx512f -mavx512bw -mavx512vbmi2
 	endif
 endif
 
