@@ -96,6 +96,16 @@ static void on_book_depth(Option *opt)
   pb_set_book_depth(opt->value);
 }
 
+static void on_serialize_tt(Option* opt);
+
+static void on_deserialize_tt(Option* opt)
+{
+  if (strcmp(opt->valString, "<empty>") == 0)
+    return;
+  size_t count = tt_deserialize(opt->valString);
+  printf("info Deserialized %zu entries.\n", count);
+}
+
 #ifdef IS_64BIT
 #define MAXHASHMB 33554432
 #else
@@ -103,6 +113,9 @@ static void on_book_depth(Option *opt)
 #endif
 
 static Option optionsMap[] = {
+  { "PersistentTTMinDepth", OPT_TYPE_SPIN, 4, 0, 255, NULL, NULL, 0, NULL },
+  { "PersistentTTSerialize", OPT_TYPE_STRING, 0, 0, 0, "<empty>", on_serialize_tt, 0, NULL },
+  { "PersistentTTDeserialize", OPT_TYPE_STRING, 0, 0, 0, "<empty>", on_deserialize_tt, 0, NULL },
   { "Contempt", OPT_TYPE_SPIN, 24, -100, 100, NULL, NULL, 0, NULL },
   { "Analysis Contempt", OPT_TYPE_COMBO, 0, 0, 0,
     "Off var Off var White var Black", NULL, 0, NULL },
@@ -295,4 +308,15 @@ bool option_set_by_name(char *name, char *value)
   }
 
   return false;
+}
+
+static void on_serialize_tt(Option* opt)
+{
+  (void)opt;
+
+  if (strcmp(opt->valString, "<empty>") == 0)
+    return;
+  int minDepth = option_value(OPT_PERSISTENT_TT_MIN_DEPTH);
+  size_t count = tt_serialize(opt->valString, minDepth);
+  printf("info Serialized %zu entries.\n", count);
 }
